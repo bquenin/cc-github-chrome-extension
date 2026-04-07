@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Review with Claude Code",
+  "version": "1.0.0",
+  "description": "Adds a 'Review with Claude Code' button to GitHub PRs that launches a local Claude Code review",
+  "permissions": ["activeTab"],
+  "host_permissions": ["https://github.com/*", "https://github.intuit.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://github.com/*/pull/*", "https://github.intuit.com/*/pull/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"]
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
