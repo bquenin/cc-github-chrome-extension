@@ -149,16 +149,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         log("Shell command: \(shellCmd)")
 
-        // Use osascript to open a new iTerm2 tab
+        // Use osascript to open a new iTerm2 tab (or window if iTerm2 isn't running)
         let script = """
         tell application "iTerm2"
             activate
-            tell current window
-                set newTab to (create tab with default profile)
-                tell current session of newTab
+            if (count of windows) = 0 then
+                set newWindow to (create window with default profile)
+                tell current session of newWindow
                     write text "\(asCmd)"
                 end tell
-            end tell
+            else
+                tell current window
+                    set newTab to (create tab with default profile)
+                    tell current session of newTab
+                        write text "\(asCmd)"
+                    end tell
+                end tell
+            end if
         end tell
         """
 
