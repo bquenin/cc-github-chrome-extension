@@ -129,14 +129,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let shellCmd: String
         if let repoPath = repoPath {
             let escapedPath = repoPath.replacingOccurrences(of: "'", with: "'\\''")
+            let fetchCmd = "cd '\(escapedPath)' && git fetch --all --prune"
             if hasExistingSession {
                 // Resume existing session
-                shellCmd = "cd '\(escapedPath)' && claude --resume '\(sessionIdStr)'"
+                shellCmd = "\(fetchCmd) && claude --resume '\(sessionIdStr)'"
             } else {
                 // Start new session with deterministic ID
                 let prompt = "Please review this PR: \(prURL). Switch to the local PR branch to help. Consider existing PR comments and review feedback as context for your review."
                 let escapedPrompt = prompt.replacingOccurrences(of: "'", with: "'\\''")
-                shellCmd = "cd '\(escapedPath)' && claude --session-id '\(sessionIdStr)' '\(escapedPrompt)'"
+                shellCmd = "\(fetchCmd) && claude --session-id '\(sessionIdStr)' '\(escapedPrompt)'"
             }
         } else {
             shellCmd = "echo 'Repository \(repoName) not found under ~/code. Clone it first, then retry.'"
