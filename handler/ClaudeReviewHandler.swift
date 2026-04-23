@@ -133,7 +133,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 shellCmd = "\(fetchCmd) && claude --resume '\(sessionIdStr)'"
             } else {
                 // Start new session with deterministic ID
-                let prompt = "Please review this PR: \(prURL). Switch to the local PR branch to help. Consider existing PR comments and review feedback as context for your review."
+                let host = parts.first.map(String.init) ?? ""
+                let isGhes = host.contains("github.intuit.com")
+                let skillHint = isGhes ? " This PR is on GitHub Enterprise (github.intuit.com) — use the ghes skill for all GitHub operations instead of the default gh CLI." : ""
+                let prompt = "Please review this PR: \(prURL). Switch to the local PR branch to help. Consider existing PR comments and review feedback as context for your review.\(skillHint)"
                 let escapedPrompt = prompt.replacingOccurrences(of: "'", with: "'\\''")
                 shellCmd = "\(fetchCmd) && claude --session-id '\(sessionIdStr)' '\(escapedPrompt)'"
             }
