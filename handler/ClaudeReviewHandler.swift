@@ -103,7 +103,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !repoName.isEmpty {
             let findProc = Process()
             findProc.executableURL = URL(fileURLWithPath: "/usr/bin/find")
-            findProc.arguments = [codeDir, "-maxdepth", "2", "-type", "d", "-name", repoName]
+            findProc.arguments = [codeDir, "-maxdepth", "4", "-type", "d", "-name", repoName]
             let pipe = Pipe()
             findProc.standardOutput = pipe
             findProc.standardError = FileHandle.nullDevice
@@ -111,13 +111,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             findProc.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let output = String(data: data, encoding: .utf8) ?? ""
-            for line in output.split(separator: "\n") {
-                let candidate = String(line)
-                if FileManager.default.fileExists(atPath: "\(candidate)/.git") {
-                    repoPath = candidate
-                    break
-                }
-            }
+            let candidates = output.split(separator: "\n")
+                .map(String.init)
+                .filter { FileManager.default.fileExists(atPath: "\($0)/.git") }
+            // Prefer paths containing "/prod/" over "/preprod/" or others
+            repoPath = candidates.first(where: { $0.contains("/prod/") }) ?? candidates.first
         }
 
         log("Repo path: \(repoPath ?? "NOT FOUND")")
