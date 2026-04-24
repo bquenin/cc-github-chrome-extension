@@ -29,7 +29,7 @@ cd handler
 ./install.sh
 ```
 
-This compiles a small Swift app, places it in `~/Applications/AgentPRReview.app`, and registers the `agent-pr-review://` URL scheme. It also keeps `github-pr-review://` and `claude-review://` registered as compatibility aliases.
+This compiles a small Swift app, places it in `~/Applications/AgentPRReview.app`, and registers the `agent-pr-review://` URL scheme.
 
 ### 2. Load the Chrome extension
 

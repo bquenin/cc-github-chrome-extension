@@ -51,8 +51,6 @@ cat > "${APP_DIR}/Contents/Info.plist" << 'PLIST'
       <key>CFBundleURLSchemes</key>
       <array>
         <string>agent-pr-review</string>
-        <string>github-pr-review</string>
-        <string>claude-review</string>
       </array>
     </dict>
   </array>
@@ -77,8 +75,6 @@ echo ""
 echo "What was installed:"
 echo "  - ${APP_DIR} (URL scheme handler)"
 echo "  - agent-pr-review:// URL scheme registered"
-echo "  - github-pr-review:// compatibility alias registered"
-echo "  - claude-review:// compatibility alias registered"
 echo ""
 echo "Next steps:"
 echo "  1. Load the Chrome extension from the extension/ directory"

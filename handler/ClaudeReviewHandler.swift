@@ -3,7 +3,6 @@ import CommonCrypto
 
 let HOME_DIR = "HOME_DIR_PLACEHOLDER"
 let PRIMARY_URL_SCHEME = "agent-pr-review"
-let LEGACY_URL_SCHEMES = ["github-pr-review", "claude-review"]
 let REVIEW_SUPPORT_DIR_NAME = "AgentPRReview"
 let LEGACY_REVIEW_SUPPORT_DIR_NAMES = ["GitHubPRReview", "ClaudeReview"]
 let REVIEW_LOG_FILE_NAME = "agent-pr-review.log"
@@ -299,7 +298,9 @@ func ensureParentDirectory(for path: String) {
 
 func ensureGlobalStateIgnored() {
     let fileManager = FileManager.default
-    let excludePath = "\(HOME_DIR)/.config/git/ignore"
+    let configuredExcludeResult = runShellCommand("git config --global --get core.excludesfile")
+    let configuredExcludePath = configuredExcludeResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    let excludePath = configuredExcludePath.isEmpty ? "\(HOME_DIR)/.config/git/ignore" : configuredExcludePath
     let excludeParentPath = (excludePath as NSString).deletingLastPathComponent
     try? fileManager.createDirectory(atPath: excludeParentPath, withIntermediateDirectories: true, attributes: nil)
 
@@ -317,6 +318,52 @@ func ensureGlobalStateIgnored() {
         try? handle.close()
     } else {
         try? line.write(toFile: excludePath, atomically: true, encoding: .utf8)
+    }
+}
+
+func cursorProjectDirName(for workspacePath: String) -> String {
+    let trimmedPath = workspacePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    var components: [String] = []
+    var current = ""
+
+    for scalar in trimmedPath.unicodeScalars {
+        if CharacterSet.alphanumerics.contains(scalar) {
+            current.append(String(scalar))
+        } else if !current.isEmpty {
+            components.append(current)
+            current = ""
+        }
+    }
+
+    if !current.isEmpty {
+        components.append(current)
+    }
+
+    return components.isEmpty ? "workspace" : components.joined(separator: "-")
+}
+
+func trustCursorWorkspace(_ workspacePath: String, logger: (String) -> Void) {
+    let fileManager = FileManager.default
+    let projectDir = "\(HOME_DIR)/.cursor/projects/\(cursorProjectDirName(for: workspacePath))"
+    let trustFile = "\(projectDir)/.workspace-trusted"
+    let trustedAt = ISO8601DateFormatter().string(from: Date())
+    let trustObject = [
+        "trustedAt": trustedAt,
+        "workspacePath": workspacePath
+    ]
+
+    guard JSONSerialization.isValidJSONObject(trustObject),
+          let data = try? JSONSerialization.data(withJSONObject: trustObject, options: [.prettyPrinted, .sortedKeys]) else {
+        logger("Failed to create Cursor workspace trust payload for \(workspacePath)")
+        return
+    }
+
+    do {
+        try fileManager.createDirectory(atPath: projectDir, withIntermediateDirectories: true, attributes: nil)
+        try data.write(to: URL(fileURLWithPath: trustFile), options: .atomic)
+        logger("Trusted Cursor workspace at \(workspacePath)")
+    } catch {
+        logger("Failed to trust Cursor workspace at \(workspacePath): \(error.localizedDescription)")
     }
 }
 
@@ -542,6 +589,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func launchITerm(shellCmd: String) -> Bool {
+        // Escape backslashes and double quotes for AppleScript string embedding.
+        let asCmd = shellCmd
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+
+        let script = """
+        tell application "iTerm2"
+            activate
+            if (count of windows) = 0 then
+                set newWindow to (create window with default profile)
+                tell current session of newWindow
+                    write text "\(asCmd)"
+                end tell
+            else
+                tell current window
+                    set newTab to (create tab with default profile)
+                    tell current session of newTab
+                        write text "\(asCmd)"
+                    end tell
+                end tell
+            end if
+        end tell
+        """
+
+        log("Running AppleScript...")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        let errPipe = Pipe()
+        process.standardError = errPipe
+        try? process.run()
+        process.waitUntilExit()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let errStr = String(data: errData, encoding: .utf8) ?? ""
+        log("osascript exit code: \(process.terminationStatus), stderr: \(errStr)")
+        return process.terminationStatus == 0
+    }
+
+    func writePendingShellCommand(_ shellCmd: String, to path: String) -> Bool {
+        do {
+            try "\(shellCmd)\n".write(toFile: path, atomically: true, encoding: .utf8)
+            return true
+        } catch {
+            log("Failed to write pending shell command to \(path): \(error.localizedDescription)")
+            return false
+        }
+    }
+
     @objc func handleURL(_ event: NSAppleEventDescriptor, withReply reply: NSAppleEventDescriptor) {
         guard let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue else {
             log("ERROR: no URL in event")
@@ -552,7 +648,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard let components = URLComponents(string: urlString),
               let scheme = components.scheme,
-              ([PRIMARY_URL_SCHEME] + LEGACY_URL_SCHEMES).contains(scheme),
+              scheme == PRIMARY_URL_SCHEME,
               let host = components.host else {
             log("ERROR: invalid URL")
             NSApplication.shared.terminate(nil)
@@ -590,6 +686,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let sessionId = uuidV5(namespace: namespace, name: prKey)
         let sessionIdStr = sessionId.uuidString.lowercased()
         log("Claude session ID: \(sessionIdStr) (from key: \(prKey))")
+
+        ensureReviewSupportDir()
+        let pendingCommandPath = "\(reviewSupportDir())/pending-\(safePathComponent(prKey))-\(UUID().uuidString.lowercased()).zsh"
+        let escapedPendingCommandPath = shellEscape(pendingCommandPath)
+        let pendingShellCmd = "cmd_file='\(escapedPendingCommandPath)'; echo 'Preparing PR review for \(shellEscape(prURL))...'; deadline=$((SECONDS + 120)); while [[ ! -s \"$cmd_file\" && $SECONDS -lt $deadline ]]; do sleep 0.1; done; if [[ ! -s \"$cmd_file\" ]]; then echo 'Timed out waiting for Agent PR Review to prepare the session.'; else source \"$cmd_file\"; rm -f \"$cmd_file\"; fi"
+        let openedPendingTerminal = launchITerm(shellCmd: pendingShellCmd)
 
         // Search for the repo under ~/code using find
         let codeDir = "\(HOME_DIR)/code"
@@ -651,9 +753,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 var agentSessions = loadAgentSessionMap()
                 let existingChatId = agentSessions[prKey]
                 log("Existing Cursor chat: \(existingChatId ?? "NONE")")
+                trustCursorWorkspace(launchPath, logger: log)
 
                 if let existingChatId = existingChatId, !existingChatId.isEmpty {
-                    shellCmd = "\(fetchCmd) && agent --resume '\(shellEscape(existingChatId))'"
+                    shellCmd = "\(fetchCmd) && agent --resume '\(shellEscape(existingChatId))' '\(escapedPrompt)'"
                 } else {
                     let createChatResult = runShellCommand("cd '\(escapedPath)' && agent create-chat")
                     let trimmedStdout = createChatResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -677,44 +780,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             shellCmd = "printf 'Repository %s not found under ~/code. Clone it first, then retry.\\n' '\(shellEscape(repoName))'"
         }
 
-        // Escape backslashes and double quotes for AppleScript string embedding
-        let asCmd = shellCmd
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-
         log("Shell command: \(shellCmd)")
 
-        // Use osascript to open a new iTerm2 tab (or window if iTerm2 isn't running)
-        let script = """
-        tell application "iTerm2"
-            activate
-            if (count of windows) = 0 then
-                set newWindow to (create window with default profile)
-                tell current session of newWindow
-                    write text "\(asCmd)"
-                end tell
-            else
-                tell current window
-                    set newTab to (create tab with default profile)
-                    tell current session of newTab
-                        write text "\(asCmd)"
-                    end tell
-                end tell
-            end if
-        end tell
-        """
-
-        log("Running AppleScript...")
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-        let errPipe = Pipe()
-        process.standardError = errPipe
-        try? process.run()
-        process.waitUntilExit()
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-        let errStr = String(data: errData, encoding: .utf8) ?? ""
-        log("osascript exit code: \(process.terminationStatus), stderr: \(errStr)")
+        if openedPendingTerminal {
+            if writePendingShellCommand(shellCmd, to: pendingCommandPath) {
+                log("Wrote pending shell command to \(pendingCommandPath)")
+            } else {
+                _ = launchITerm(shellCmd: shellCmd)
+            }
+        } else {
+            _ = launchITerm(shellCmd: shellCmd)
+        }
 
         NSApplication.shared.terminate(nil)
     }
