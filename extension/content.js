@@ -22,15 +22,104 @@ const REVIEW_CLIS = {
   },
 };
 
-function getSelectedCli() {
-  const savedCli = window.localStorage.getItem(REVIEW_CLI_STORAGE_KEY);
-  return REVIEW_CLIS[savedCli] ? savedCli : DEFAULT_REVIEW_CLI;
+const launcherRenderers = new WeakMap();
+let selectedCli = DEFAULT_REVIEW_CLI;
+let selectionLoaded = false;
+
+function normalizeCli(cli) {
+  return REVIEW_CLIS[cli] ? cli : DEFAULT_REVIEW_CLI;
 }
 
-function setSelectedCli(cli) {
-  if (REVIEW_CLIS[cli]) {
-    window.localStorage.setItem(REVIEW_CLI_STORAGE_KEY, cli);
+function getStorageArea() {
+  return chrome?.storage?.local ?? null;
+}
+
+function getLegacySelectedCli() {
+  try {
+    return normalizeCli(window.localStorage.getItem(REVIEW_CLI_STORAGE_KEY));
+  } catch {
+    return DEFAULT_REVIEW_CLI;
   }
+}
+
+function clearLegacySelectedCli() {
+  try {
+    window.localStorage.removeItem(REVIEW_CLI_STORAGE_KEY);
+  } catch {
+    // Ignore storage cleanup failures in the page context.
+  }
+}
+
+function loadSelectedCli() {
+  const storage = getStorageArea();
+  if (!storage) {
+    return Promise.resolve(getLegacySelectedCli());
+  }
+
+  return new Promise((resolve) => {
+    storage.get([REVIEW_CLI_STORAGE_KEY], (items) => {
+      if (chrome.runtime?.lastError) {
+        resolve(getLegacySelectedCli());
+        return;
+      }
+
+      if (Object.prototype.hasOwnProperty.call(items, REVIEW_CLI_STORAGE_KEY)) {
+        resolve(normalizeCli(items[REVIEW_CLI_STORAGE_KEY]));
+        return;
+      }
+
+      const migratedCli = getLegacySelectedCli();
+      storage.set({ [REVIEW_CLI_STORAGE_KEY]: migratedCli }, () => {
+        if (!chrome.runtime?.lastError) {
+          clearLegacySelectedCli();
+        }
+        resolve(migratedCli);
+      });
+    });
+  });
+}
+
+function persistSelectedCli(cli) {
+  selectedCli = normalizeCli(cli);
+
+  const storage = getStorageArea();
+  if (storage) {
+    storage.set({ [REVIEW_CLI_STORAGE_KEY]: selectedCli }, () => {
+      if (!chrome.runtime?.lastError) {
+        clearLegacySelectedCli();
+      }
+    });
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(REVIEW_CLI_STORAGE_KEY, selectedCli);
+  } catch {
+    // Ignore storage write failures in the page context.
+  }
+}
+
+function rerenderLaunchers() {
+  document.querySelectorAll(".review-launcher").forEach((launcher) => {
+    const render = launcherRenderers.get(launcher);
+    if (render) {
+      render();
+    }
+  });
+}
+
+function watchStoredCli() {
+  if (!chrome?.storage?.onChanged) return;
+
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "local" || !changes[REVIEW_CLI_STORAGE_KEY]) return;
+
+    const nextCli = normalizeCli(changes[REVIEW_CLI_STORAGE_KEY].newValue);
+    if (nextCli === selectedCli) return;
+
+    selectedCli = nextCli;
+    rerenderLaunchers();
+  });
 }
 
 function getLaunchUrl(cli, prPath) {
@@ -114,7 +203,6 @@ function createLauncher() {
   menu.setAttribute("role", "menu");
 
   const render = () => {
-    const selectedCli = getSelectedCli();
     const selectedConfig = REVIEW_CLIS[selectedCli];
     primaryButton.innerHTML = `${REVIEW_ICON_SVG} ${selectedConfig.buttonLabel}`;
     primaryButton.title = selectedConfig.title;
@@ -134,7 +222,7 @@ function createLauncher() {
 
         option.addEventListener("click", (event) => {
           event.preventDefault();
-          setSelectedCli(cli);
+          persistSelectedCli(cli);
           setMenuOpen(launcher, false);
           render();
         });
@@ -144,11 +232,13 @@ function createLauncher() {
     );
   };
 
+  launcherRenderers.set(launcher, render);
+
   primaryButton.addEventListener("click", (event) => {
     event.preventDefault();
     const prPath = getPrUrl();
     if (!prPath) return;
-    window.location.href = getLaunchUrl(getSelectedCli(), prPath);
+    window.location.href = getLaunchUrl(selectedCli, prPath);
   });
 
   toggleButton.addEventListener("click", (event) => {
@@ -172,6 +262,7 @@ function createLauncher() {
 }
 
 function injectButton() {
+  if (!selectionLoaded) return;
   if (document.querySelector(".review-launcher")) return;
   if (!getPrUrl()) return;
 
@@ -180,9 +271,6 @@ function injectButton() {
 
   target.prepend(createLauncher());
 }
-
-// Run on initial load
-injectButton();
 
 document.addEventListener("click", (event) => {
   const target = event.target;
@@ -204,3 +292,11 @@ observer.observe(document.body, { childList: true, subtree: true });
 
 // Also handle popstate for back/forward navigation
 window.addEventListener("popstate", () => setTimeout(injectButton, 100));
+
+watchStoredCli();
+
+void loadSelectedCli().then((storedCli) => {
+  selectedCli = storedCli;
+  selectionLoaded = true;
+  injectButton();
+});

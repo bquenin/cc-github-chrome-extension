@@ -7,10 +7,22 @@ let LEGACY_URL_SCHEMES = ["github-pr-review", "claude-review"]
 let REVIEW_SUPPORT_DIR_NAME = "AgentPRReview"
 let LEGACY_REVIEW_SUPPORT_DIR_NAMES = ["GitHubPRReview", "ClaudeReview"]
 let REVIEW_LOG_FILE_NAME = "agent-pr-review.log"
+let WORKTREE_CLEANUP_MAX_AGE_SECONDS: TimeInterval = 60.0 * 24.0 * 60.0 * 60.0
 
 enum ReviewCLI: String {
     case agent
     case claude
+}
+
+struct RepoCandidate {
+    let path: String
+    let score: Int
+    let reasons: [String]
+}
+
+struct RemoteInfo {
+    let name: String
+    let identifier: String?
 }
 
 // Generate a deterministic UUID v5 from a namespace UUID + a string
@@ -156,6 +168,339 @@ func parseAgentChatId(from output: String) -> String? {
     return lastLine.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
 }
 
+func safePathComponent(_ value: String) -> String {
+    let allowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+    let sanitizedScalars = value.unicodeScalars.map { scalar -> String in
+        allowedCharacters.contains(scalar) ? String(scalar) : "_"
+    }
+
+    let sanitized = sanitizedScalars.joined()
+    return sanitized.isEmpty ? "unknown" : sanitized
+}
+
+func normalizeRemoteIdentifier(_ remoteURL: String) -> String? {
+    var trimmed = remoteURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+        return nil
+    }
+
+    if trimmed.hasSuffix(".git") {
+        trimmed.removeLast(4)
+    }
+
+    if trimmed.contains("://"),
+       let components = URLComponents(string: trimmed),
+       let host = components.host {
+        let pathParts = components.path
+            .split(separator: "/")
+            .map(String.init)
+            .filter { !$0.isEmpty }
+
+        guard pathParts.count >= 2 else {
+            return nil
+        }
+
+        return ([host] + Array(pathParts.suffix(2))).joined(separator: "/")
+    }
+
+    if let atRange = trimmed.range(of: "@"),
+       let colonRange = trimmed[atRange.upperBound...].range(of: ":") {
+        let host = String(trimmed[atRange.upperBound..<colonRange.lowerBound])
+        let path = trimmed[colonRange.upperBound...]
+        let pathParts = path.split(separator: "/").map(String.init)
+
+        guard pathParts.count >= 2 else {
+            return nil
+        }
+
+        return ([host] + Array(pathParts.suffix(2))).joined(separator: "/")
+    }
+
+    let pathParts = trimmed
+        .split(separator: "/")
+        .map(String.init)
+        .filter { !$0.isEmpty }
+
+    guard pathParts.count >= 3 else {
+        return nil
+    }
+
+    return ([pathParts[pathParts.count - 3]] + Array(pathParts.suffix(2))).joined(separator: "/")
+}
+
+func remoteInfos(for repoPath: String) -> [RemoteInfo] {
+    let escapedPath = shellEscape(repoPath)
+    let result = runShellCommand("git -C '\(escapedPath)' remote -v")
+
+    guard result.status == 0 else {
+        return []
+    }
+
+    var infos: [RemoteInfo] = []
+
+    for line in result.stdout.split(separator: "\n") {
+        let fields = line.split(whereSeparator: \.isWhitespace)
+        guard fields.count >= 3, fields[2] == "(fetch)" else {
+            continue
+        }
+
+        let name = String(fields[0])
+        let identifier = normalizeRemoteIdentifier(String(fields[1]))
+        if !infos.contains(where: { $0.name == name }) {
+            infos.append(RemoteInfo(name: name, identifier: identifier))
+        }
+    }
+
+    return infos
+}
+
+func preferredRemoteName(for repoPath: String, expectedRemote: String, logger: (String) -> Void) -> String? {
+    let infos = remoteInfos(for: repoPath)
+
+    if let exactMatch = infos.first(where: { $0.identifier == expectedRemote }) {
+        logger("Using git remote \(exactMatch.name) for \(expectedRemote)")
+        return exactMatch.name
+    }
+
+    if let origin = infos.first(where: { $0.name == "origin" }) {
+        logger("Falling back to git remote origin for \(repoPath)")
+        return origin.name
+    }
+
+    if let firstRemote = infos.first {
+        logger("Falling back to git remote \(firstRemote.name) for \(repoPath)")
+        return firstRemote.name
+    }
+
+    logger("No git remotes found for \(repoPath)")
+    return nil
+}
+
+func worktreeRootDir(repoPath: String) -> String {
+    "\(repoPath)/.agent-pr-review/worktrees"
+}
+
+func worktreePath(repoPath: String, prNumber: String) -> String {
+    "\(worktreeRootDir(repoPath: repoPath))/pr-\(safePathComponent(prNumber))"
+}
+
+func worktreeBranchName(prNumber: String) -> String {
+    "agent-pr-review/pr-\(safePathComponent(prNumber))"
+}
+
+func worktreeRemoteRef(remoteName: String, prNumber: String) -> String {
+    "refs/remotes/\(remoteName)/agent-pr-review/pr-\(safePathComponent(prNumber))"
+}
+
+func ensureParentDirectory(for path: String) {
+    let parentDir = (path as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true, attributes: nil)
+}
+
+func ensureGlobalStateIgnored() {
+    let fileManager = FileManager.default
+    let excludePath = "\(HOME_DIR)/.config/git/ignore"
+    let excludeParentPath = (excludePath as NSString).deletingLastPathComponent
+    try? fileManager.createDirectory(atPath: excludeParentPath, withIntermediateDirectories: true, attributes: nil)
+
+    let ignoreEntry = ".agent-pr-review/"
+    if let data = fileManager.contents(atPath: excludePath),
+       let existing = String(data: data, encoding: .utf8),
+       existing.split(separator: "\n").contains(where: { $0.trimmingCharacters(in: .whitespaces) == ignoreEntry }) {
+        return
+    }
+
+    let line = "\n\(ignoreEntry)\n"
+    if let handle = FileHandle(forWritingAtPath: excludePath) {
+        handle.seekToEndOfFile()
+        handle.write(Data(line.utf8))
+        try? handle.close()
+    } else {
+        try? line.write(toFile: excludePath, atomically: true, encoding: .utf8)
+    }
+}
+
+func branchExists(repoPath: String, branchName: String) -> Bool {
+    let escapedRepoPath = shellEscape(repoPath)
+    let escapedBranchName = shellEscape(branchName)
+    let result = runShellCommand("git -C '\(escapedRepoPath)' show-ref --verify --quiet 'refs/heads/\(escapedBranchName)'")
+    return result.status == 0
+}
+
+func worktreeIsClean(_ path: String) -> Bool {
+    let escapedPath = shellEscape(path)
+    let result = runShellCommand("git -C '\(escapedPath)' status --porcelain")
+    return result.status == 0 && result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+}
+
+func cleanupStaleWorktrees(repoPath: String, currentWorktreePath: String, logger: (String) -> Void) {
+    let fileManager = FileManager.default
+    let rootDir = worktreeRootDir(repoPath: repoPath)
+    var isDirectory: ObjCBool = false
+
+    guard fileManager.fileExists(atPath: rootDir, isDirectory: &isDirectory),
+          isDirectory.boolValue,
+          let entries = try? fileManager.contentsOfDirectory(atPath: rootDir) else {
+        return
+    }
+
+    let escapedRepoPath = shellEscape(repoPath)
+    let now = Date()
+
+    for entry in entries where entry.hasPrefix("pr-") {
+        let path = "\(rootDir)/\(entry)"
+        var entryIsDirectory: ObjCBool = false
+
+        guard path != currentWorktreePath,
+              fileManager.fileExists(atPath: path, isDirectory: &entryIsDirectory),
+              entryIsDirectory.boolValue,
+              let attributes = try? fileManager.attributesOfItem(atPath: path),
+              let modifiedAt = attributes[.modificationDate] as? Date,
+              now.timeIntervalSince(modifiedAt) >= WORKTREE_CLEANUP_MAX_AGE_SECONDS else {
+            continue
+        }
+
+        guard worktreeIsClean(path) else {
+            logger("Skipping stale worktree cleanup because it has local changes: \(path)")
+            continue
+        }
+
+        let escapedPath = shellEscape(path)
+        let removeResult = runShellCommand("git -C '\(escapedRepoPath)' worktree remove '\(escapedPath)'")
+        if removeResult.status == 0 {
+            logger("Removed stale clean worktree at \(path)")
+        } else {
+            logger("Failed to remove stale worktree at \(path): \(removeResult.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+    }
+}
+
+func updateExistingWorktree(path: String, branchName: String, remoteRef: String, logger: (String) -> Void) {
+    let escapedPath = shellEscape(path)
+    let escapedBranchName = shellEscape(branchName)
+    let escapedRemoteRef = shellEscape(remoteRef)
+
+    guard worktreeIsClean(path) else {
+        logger("Worktree has local changes; leaving current checkout unchanged at \(path)")
+        return
+    }
+
+    let branchExistsInWorktree = runShellCommand("git -C '\(escapedPath)' show-ref --verify --quiet 'refs/heads/\(escapedBranchName)'").status == 0
+    let checkoutCommand = branchExistsInWorktree
+        ? "git -C '\(escapedPath)' checkout '\(escapedBranchName)'"
+        : "git -C '\(escapedPath)' checkout -b '\(escapedBranchName)' '\(escapedRemoteRef)'"
+
+    let checkoutResult = runShellCommand(checkoutCommand)
+    if checkoutResult.status != 0 {
+        logger("Failed to prepare worktree branch \(branchName): \(checkoutResult.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+        return
+    }
+
+    let mergeResult = runShellCommand("git -C '\(escapedPath)' merge --ff-only '\(escapedRemoteRef)'")
+    if mergeResult.status != 0 {
+        logger("Worktree branch \(branchName) is not fast-forwardable; leaving current checkout unchanged")
+    }
+}
+
+func prepareWorktree(repoPath: String, remoteName: String, prNumber: String, logger: (String) -> Void) -> String? {
+    let worktreeDir = worktreePath(repoPath: repoPath, prNumber: prNumber)
+    let branchName = worktreeBranchName(prNumber: prNumber)
+    let remoteRef = worktreeRemoteRef(remoteName: remoteName, prNumber: prNumber)
+    let escapedRepoPath = shellEscape(repoPath)
+    let escapedRemoteName = shellEscape(remoteName)
+    let escapedRemoteRef = shellEscape(remoteRef)
+    let escapedWorktreeDir = shellEscape(worktreeDir)
+    let prRefspec = "+refs/pull/\(prNumber)/head:\(remoteRef)"
+    let escapedPrRefspec = shellEscape(prRefspec)
+
+    let pruneResult = runShellCommand("git -C '\(escapedRepoPath)' worktree prune")
+    if pruneResult.status != 0 {
+        logger("git worktree prune failed: \(pruneResult.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+
+    let fetchResult = runShellCommand("git -C '\(escapedRepoPath)' fetch '\(escapedRemoteName)' '\(escapedPrRefspec)'")
+    if fetchResult.status != 0 {
+        logger("Failed to fetch PR \(prNumber) into a worktree ref: \(fetchResult.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+        return nil
+    }
+
+    ensureGlobalStateIgnored()
+    cleanupStaleWorktrees(repoPath: repoPath, currentWorktreePath: worktreeDir, logger: logger)
+    ensureParentDirectory(for: worktreeDir)
+
+    if FileManager.default.fileExists(atPath: worktreeDir) {
+        logger("Reusing worktree at \(worktreeDir)")
+        updateExistingWorktree(path: worktreeDir, branchName: branchName, remoteRef: remoteRef, logger: logger)
+        return worktreeDir
+    }
+
+    let addCommand: String
+    if branchExists(repoPath: repoPath, branchName: branchName) {
+        addCommand = "git -C '\(escapedRepoPath)' worktree add '\(escapedWorktreeDir)' '\(shellEscape(branchName))'"
+    } else {
+        addCommand = "git -C '\(escapedRepoPath)' worktree add -b '\(shellEscape(branchName))' '\(escapedWorktreeDir)' '\(escapedRemoteRef)'"
+    }
+
+    let addResult = runShellCommand(addCommand)
+    if addResult.status != 0 {
+        logger("Failed to create PR worktree at \(worktreeDir): \(addResult.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+        return nil
+    }
+
+    logger("Created worktree at \(worktreeDir)")
+    updateExistingWorktree(path: worktreeDir, branchName: branchName, remoteRef: remoteRef, logger: logger)
+    return worktreeDir
+}
+
+func selectRepoPath(from candidates: [String], host: String, owner: String, repoName: String, logger: (String) -> Void) -> String? {
+    guard !candidates.isEmpty else {
+        return nil
+    }
+
+    let expectedRemote = "\(host)/\(owner)/\(repoName)"
+    let scoredCandidates = candidates.map { path -> RepoCandidate in
+        var score = 0
+        var reasons: [String] = []
+
+        let remotes = remoteInfos(for: path).compactMap(\.identifier)
+        if remotes.contains(expectedRemote) {
+            score += 100
+            reasons.append("exact remote match")
+        }
+
+        if path.contains("/\(owner)/\(repoName)") {
+            score += 20
+            reasons.append("owner/repo path")
+        }
+
+        if path.contains("/prod/") {
+            score += 10
+            reasons.append("prod path")
+        }
+
+        return RepoCandidate(path: path, score: score, reasons: reasons)
+    }
+    .sorted { lhs, rhs in
+        if lhs.score != rhs.score {
+            return lhs.score > rhs.score
+        }
+
+        return lhs.path < rhs.path
+    }
+
+    for candidate in scoredCandidates {
+        let reasonSummary = candidate.reasons.isEmpty ? "fallback order" : candidate.reasons.joined(separator: ", ")
+        logger("Repo candidate: \(candidate.path) [score=\(candidate.score)] \(reasonSummary)")
+    }
+
+    if scoredCandidates.count > 1,
+       scoredCandidates[0].score == scoredCandidates[1].score {
+        logger("Multiple equally ranked repo candidates found; choosing lexicographically first")
+    }
+
+    return scoredCandidates.first?.path
+}
+
 // Check if a claude session with the given ID exists
 func sessionExists(_ sessionId: String) -> Bool {
     // Claude stores sessions under ~/.claude/projects/
@@ -232,7 +577,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let prURL = "https://\(ghPath)"
 
         // Extract repo name: host/owner/repo/pull/123 -> repo is parts[2]
+        let owner = parts[1]
         let repoName = parts[2]
+        let prNumber = parts[4]
         log("Repo name: \(repoName)")
         log("Selected CLI: \(reviewCLI.rawValue)")
 
@@ -262,8 +609,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let candidates = output.split(separator: "\n")
                 .map(String.init)
                 .filter { FileManager.default.fileExists(atPath: "\($0)/.git") }
-            // Prefer paths containing "/prod/" over "/preprod/" or others
-            repoPath = candidates.first(where: { $0.contains("/prod/") }) ?? candidates.first
+            repoPath = selectRepoPath(from: candidates, host: host, owner: owner, repoName: repoName, logger: log)
         }
 
         log("Repo path: \(repoPath ?? "NOT FOUND")")
@@ -274,11 +620,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let shellCmd: String
         if let repoPath = repoPath {
-            let escapedPath = shellEscape(repoPath)
+            let expectedRemote = "\(host)/\(owner)/\(repoName)"
+            let remoteName = preferredRemoteName(for: repoPath, expectedRemote: expectedRemote, logger: log)
+            let worktreePath = remoteName.flatMap { remoteName in
+                prepareWorktree(repoPath: repoPath, remoteName: remoteName, prNumber: prNumber, logger: log)
+            }
+            let launchPath = worktreePath ?? repoPath
+            if worktreePath == nil {
+                log("Falling back to the canonical repo checkout at \(repoPath)")
+            }
+
+            let escapedPath = shellEscape(launchPath)
             let fetchCmd = "cd '\(escapedPath)' && git fetch --all --prune"
             let isGhes = host.contains("github.intuit.com")
             let skillHint = isGhes ? " This PR is on GitHub Enterprise (github.intuit.com) - use the ghes skill for all GitHub operations instead of the default gh CLI." : ""
-            let prompt = "Please review this PR: \(prURL). Switch to the local PR branch to help. Consider existing PR comments and review feedback as context for your review.\(skillHint)"
+            let workspaceHint = worktreePath == nil
+                ? "You are already in the local repo checkout for this PR."
+                : "You are already in a dedicated local git worktree for this PR."
+            let prompt = "Please review this PR: \(prURL). \(workspaceHint) Consider existing PR comments and review feedback as context for your review.\(skillHint)"
             let escapedPrompt = shellEscape(prompt)
 
             switch reviewCLI {
@@ -296,7 +655,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if let existingChatId = existingChatId, !existingChatId.isEmpty {
                     shellCmd = "\(fetchCmd) && agent --resume '\(shellEscape(existingChatId))'"
                 } else {
-                    let createChatResult = runShellCommand("agent create-chat")
+                    let createChatResult = runShellCommand("cd '\(escapedPath)' && agent create-chat")
                     let trimmedStdout = createChatResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
                     let trimmedStderr = createChatResult.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
                     log("agent create-chat exit code: \(createChatResult.status), stdout: \(trimmedStdout), stderr: \(trimmedStderr)")

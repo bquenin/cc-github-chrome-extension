@@ -3,7 +3,7 @@
   "name": "PR Review Launcher",
   "version": "1.0.0",
   "description": "Adds a PR review launcher to GitHub pull requests for Cursor CLI (agent) or Claude Code",
-  "permissions": ["activeTab"],
+  "permissions": ["storage"],
   "host_permissions": ["https://github.com/*", "https://github.intuit.com/*"],
   "content_scripts": [
     {
