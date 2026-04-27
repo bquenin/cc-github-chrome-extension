@@ -243,6 +243,27 @@ func agentTerminalShellCommand(launchPath: String, prKey: String, prompt: String
     """
 }
 
+func claudeTerminalShellCommand(launchPath: String, sessionId: String, prompt: String) -> String {
+    let escapedPath = shellEscape(launchPath)
+    let escapedPrompt = shellEscape(prompt)
+    let escapedSessionId = shellEscape(sessionId)
+    let escapedClaudeProjectsDir = shellEscape("\(HOME_DIR)/.claude/projects")
+
+    return """
+    cd '\(escapedPath)' || { echo 'Failed to enter review workspace: \(escapedPath)'; return 1 2>/dev/null || true; }
+    git fetch --all --prune || { echo 'git fetch failed; leaving this shell open for debugging.'; return 1 2>/dev/null || true; }
+
+    session_id='\(escapedSessionId)'
+    if [[ -d '\(escapedClaudeProjectsDir)' ]] && [[ -n "$(/usr/bin/find '\(escapedClaudeProjectsDir)' -name "$session_id.jsonl" -type f -print -quit)" ]]; then
+      echo "Resuming Claude session: $session_id"
+      claude --resume "$session_id"
+    else
+      echo "Starting Claude session: $session_id"
+      claude --session-id "$session_id" '\(escapedPrompt)'
+    fi
+    """
+}
+
 func safePathComponent(_ value: String) -> String {
     let allowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
     let sanitizedScalars = value.unicodeScalars.map { scalar -> String in
@@ -624,23 +645,6 @@ func selectRepoPath(from candidates: [String], host: String, owner: String, repo
     return scoredCandidates.first?.path
 }
 
-// Check if a claude session with the given ID exists
-func sessionExists(_ sessionId: String) -> Bool {
-    // Claude stores sessions under ~/.claude/projects/
-    // We check by trying to find a matching session file
-    let findProc = Process()
-    findProc.executableURL = URL(fileURLWithPath: "/usr/bin/find")
-    findProc.arguments = ["\(HOME_DIR)/.claude/projects", "-name", "\(sessionId).jsonl", "-type", "f"]
-    let pipe = Pipe()
-    findProc.standardOutput = pipe
-    findProc.standardError = FileHandle.nullDevice
-    try? findProc.run()
-    findProc.waitUntilExit()
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return !output.isEmpty
-}
-
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSAppleEventManager.shared().setEventHandler(
@@ -791,10 +795,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         log("Repo path: \(repoPath ?? "NOT FOUND")")
 
-        // Check if a Claude session already exists for this PR
-        let hasExistingClaudeSession = sessionExists(sessionIdStr)
-        log("Existing Claude session: \(hasExistingClaudeSession)")
-
         let shellCmd: String
         if let repoPath = repoPath {
             let expectedRemote = "\(host)/\(owner)/\(repoName)"
@@ -807,23 +807,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 log("Falling back to the canonical repo checkout at \(repoPath)")
             }
 
-            let escapedPath = shellEscape(launchPath)
-            let fetchCmd = "cd '\(escapedPath)' && git fetch --all --prune"
             let isGhes = host.contains("github.intuit.com")
             let skillHint = isGhes ? " This PR is on GitHub Enterprise (github.intuit.com) - use the ghes skill for all GitHub operations instead of the default gh CLI." : ""
             let workspaceHint = worktreePath == nil
                 ? "You are already in the local repo checkout for this PR."
                 : "You are already in a dedicated local git worktree for this PR."
             let prompt = "Please review this PR: \(prURL). \(workspaceHint) Consider existing PR comments and review feedback as context for your review.\(skillHint)"
-            let escapedPrompt = shellEscape(prompt)
 
             switch reviewCLI {
             case .claude:
-                if hasExistingClaudeSession {
-                    shellCmd = "\(fetchCmd) && claude --resume '\(sessionIdStr)'"
-                } else {
-                    shellCmd = "\(fetchCmd) && claude --session-id '\(sessionIdStr)' '\(escapedPrompt)'"
-                }
+                shellCmd = claudeTerminalShellCommand(
+                    launchPath: launchPath,
+                    sessionId: sessionIdStr,
+                    prompt: prompt
+                )
             case .agent:
                 let agentSessions = loadAgentSessionMap()
                 let existingChatId = agentSessions[prKey]
