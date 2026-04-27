@@ -167,6 +167,82 @@ func parseAgentChatId(from output: String) -> String? {
     return lastLine.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
 }
 
+func agentTerminalShellCommand(launchPath: String, prKey: String, prompt: String, existingChatId: String?) -> String {
+    let escapedPath = shellEscape(launchPath)
+    let escapedPrompt = shellEscape(prompt)
+    let escapedPrKey = shellEscape(prKey)
+    let escapedExistingChatId = shellEscape(existingChatId ?? "")
+    let escapedSessionMapPath = shellEscape(agentSessionMapPath())
+
+    return """
+    cd '\(escapedPath)' || { echo 'Failed to enter review workspace: \(escapedPath)'; return 1 2>/dev/null || true; }
+    git fetch --all --prune || { echo 'git fetch failed; leaving this shell open for debugging.'; return 1 2>/dev/null || true; }
+
+    chat_id='\(escapedExistingChatId)'
+    if [[ -n "$chat_id" ]]; then
+      echo "Resuming Cursor chat: $chat_id"
+    else
+      echo 'Creating Cursor chat...'
+      chat_output_file="$(mktemp "${TMPDIR:-/tmp}/agent-pr-review-chat.XXXXXX")"
+      agent create-chat 2>&1 | tee "$chat_output_file"
+      create_chat_status=${pipestatus[1]}
+
+      if [[ $create_chat_status -eq 0 ]]; then
+        chat_id="$(AGENT_PR_REVIEW_CREATE_CHAT_OUTPUT_FILE="$chat_output_file" python3 - <<'PY'
+    import os
+    import re
+
+    output_path = os.environ["AGENT_PR_REVIEW_CREATE_CHAT_OUTPUT_FILE"]
+    with open(output_path, "r", encoding="utf-8") as handle:
+        lines = [line.strip() for line in handle if line.strip()]
+    if lines:
+        last_line = lines[-1].strip(chr(34) + chr(39))
+        match = re.search(r"[A-Za-z0-9_-]{8,}$", last_line)
+        print(match.group(0) if match else last_line)
+    PY
+    )"
+      else
+        echo "agent create-chat failed with exit code $create_chat_status; launching without a saved chat."
+      fi
+      rm -f "$chat_output_file"
+
+      if [[ -n "$chat_id" ]]; then
+        AGENT_PR_REVIEW_MAP_PATH='\(escapedSessionMapPath)' AGENT_PR_REVIEW_PR_KEY='\(escapedPrKey)' AGENT_PR_REVIEW_CHAT_ID="$chat_id" python3 - <<'PY'
+    import json
+    import os
+
+    path = os.environ["AGENT_PR_REVIEW_MAP_PATH"]
+    pr_key = os.environ["AGENT_PR_REVIEW_PR_KEY"]
+    chat_id = os.environ["AGENT_PR_REVIEW_CHAT_ID"]
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            sessions = json.load(handle)
+        if not isinstance(sessions, dict):
+            sessions = {}
+    except Exception:
+        sessions = {}
+
+    sessions[pr_key] = chat_id
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(sessions, handle, indent=2, sort_keys=True)
+        handle.write("\\n")
+    os.replace(tmp_path, path)
+    PY
+        echo "Saved Cursor chat mapping: $chat_id"
+      fi
+    fi
+
+    if [[ -n "$chat_id" ]]; then
+      agent --resume "$chat_id" '\(escapedPrompt)'
+    else
+      agent '\(escapedPrompt)'
+    fi
+    """
+}
+
 func safePathComponent(_ value: String) -> String {
     let allowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
     let sanitizedScalars = value.unicodeScalars.map { scalar -> String in
@@ -590,34 +666,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func launchITerm(shellCmd: String) -> Bool {
-        // Escape backslashes and double quotes for AppleScript string embedding.
-        let asCmd = shellCmd
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-
         let script = """
+        on run argv
+            set shellCommand to item 1 of argv
+
         tell application "iTerm2"
             activate
             if (count of windows) = 0 then
                 set newWindow to (create window with default profile)
                 tell current session of newWindow
-                    write text "\(asCmd)"
+                        write text shellCommand
                 end tell
             else
                 tell current window
                     set newTab to (create tab with default profile)
                     tell current session of newTab
-                        write text "\(asCmd)"
+                            write text shellCommand
                     end tell
                 end tell
             end if
         end tell
+        end run
         """
 
         log("Running AppleScript...")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
+        process.arguments = ["-e", script, shellCmd]
         let errPipe = Pipe()
         process.standardError = errPipe
         try? process.run()
@@ -750,31 +825,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     shellCmd = "\(fetchCmd) && claude --session-id '\(sessionIdStr)' '\(escapedPrompt)'"
                 }
             case .agent:
-                var agentSessions = loadAgentSessionMap()
+                let agentSessions = loadAgentSessionMap()
                 let existingChatId = agentSessions[prKey]
                 log("Existing Cursor chat: \(existingChatId ?? "NONE")")
                 trustCursorWorkspace(launchPath, logger: log)
-
-                if let existingChatId = existingChatId, !existingChatId.isEmpty {
-                    shellCmd = "\(fetchCmd) && agent --resume '\(shellEscape(existingChatId))' '\(escapedPrompt)'"
-                } else {
-                    let createChatResult = runShellCommand("cd '\(escapedPath)' && agent create-chat")
-                    let trimmedStdout = createChatResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let trimmedStderr = createChatResult.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-                    log("agent create-chat exit code: \(createChatResult.status), stdout: \(trimmedStdout), stderr: \(trimmedStderr)")
-
-                    if createChatResult.status == 0,
-                       let chatId = parseAgentChatId(from: createChatResult.stdout),
-                       !chatId.isEmpty {
-                        agentSessions[prKey] = chatId
-                        saveAgentSessionMap(agentSessions)
-                        log("Created Cursor chat: \(chatId)")
-                        shellCmd = "\(fetchCmd) && agent --resume '\(shellEscape(chatId))' '\(escapedPrompt)'"
-                    } else {
-                        log("Falling back to launching Cursor without a mapped chat")
-                        shellCmd = "\(fetchCmd) && agent '\(escapedPrompt)'"
-                    }
-                }
+                shellCmd = agentTerminalShellCommand(
+                    launchPath: launchPath,
+                    prKey: prKey,
+                    prompt: prompt,
+                    existingChatId: existingChatId
+                )
             }
         } else {
             shellCmd = "printf 'Repository %s not found under ~/code. Clone it first, then retry.\\n' '\(shellEscape(repoName))'"
